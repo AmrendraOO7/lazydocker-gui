@@ -1,0 +1,9 @@
+[Desktop Entry]
+Name=Lazydocker GUI
+Comment=Check Docker CE and launch Lazydocker
+Exec=lazydocker-gui
+Icon=lazydocker-gui
+Terminal=false
+Type=Application
+Categories=Development;System;Utility;
+StartupNotify=true

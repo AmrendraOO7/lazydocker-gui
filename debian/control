@@ -1,0 +1,10 @@
+Package: lazydocker-gui
+Version: 1.0.3-1
+Section: utils
+Priority: optional
+Architecture: all
+Depends: python3, python3-tk, ca-certificates, x-terminal-emulator | gnome-terminal | kgx | konsole | xfce4-terminal
+Maintainer: Local Package Builder <root@localhost>
+Description: desktop manager and launcher for Lazydocker
+ A small desktop application that checks Docker CE and Lazydocker, reports
+ available releases, and starts Lazydocker in the user's terminal emulator.

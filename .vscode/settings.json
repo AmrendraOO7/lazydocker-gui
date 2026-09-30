@@ -1,0 +1,13 @@
+{
+    "chat.tools.terminal.autoApprove": {
+        "command": true,
+        "true": true,
+        "printf": true,
+        "dpkg": true,
+        "apt-cache": true,
+        "break": true,
+        "./lazydocker-gui": true,
+        "./build-deb.sh": true,
+        "apt-get": true
+    }
+}

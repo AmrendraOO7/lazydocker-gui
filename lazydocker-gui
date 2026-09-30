@@ -1,0 +1,679 @@
+#!/usr/bin/python3
+
+import argparse
+import json
+import os
+import platform
+import queue
+import re
+import shutil
+import subprocess
+import sys
+import tarfile
+import tempfile
+import threading
+import urllib.request
+from pathlib import Path
+
+
+APP_NAME = "Lazydocker GUI"
+APP_ICON = Path("/usr/share/pixmaps/lazydocker-gui.png")
+GITHUB_API = "https://api.github.com/repos/jesseduffield/lazydocker/releases/latest"
+DOCKER_INSTALL_URL = "https://docs.docker.com/engine/install/ubuntu/"
+DOCKER_PACKAGES = (
+    "docker-ce",
+    "docker-ce-cli",
+    "containerd.io",
+    "docker-buildx-plugin",
+    "docker-compose-plugin",
+)
+USER_BINARY = Path.home() / ".local" / "bin" / "lazydocker"
+
+
+def command_output(arguments, timeout=8):
+    try:
+        result = subprocess.run(
+            arguments,
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return ""
+    return result.stdout.strip()
+
+
+def package_version(package):
+    result = command_output(
+        ["dpkg-query", "-W", "-f=${db:Status-Status}\t${Version}", package]
+    )
+    if not result.startswith("installed\t"):
+        return None
+    return result.split("\t", 1)[1]
+
+
+def apt_candidate(package):
+    output = command_output(["apt-cache", "policy", package])
+    match = re.search(r"^\s*Candidate:\s*(\S+)", output, re.MULTILINE)
+    if not match or match.group(1) == "(none)":
+        return None
+    return match.group(1)
+
+
+def version_is_newer(current, candidate):
+    if not current or not candidate:
+        return False
+    result = subprocess.run(
+        ["dpkg", "--compare-versions", current, "lt", candidate],
+        check=False,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    return result.returncode == 0
+
+
+def installed_lazydocker():
+    executable = shutil.which("lazydocker")
+    if executable:
+        return Path(executable)
+    if USER_BINARY.is_file() and os.access(USER_BINARY, os.X_OK):
+        return USER_BINARY
+    return None
+
+
+def lazydocker_version(executable):
+    output = command_output([str(executable), "--version"], timeout=4)
+    match = re.search(r"(?<![\w.])v?(\d+\.\d+(?:\.\d+)+(?:[-+][\w.-]+)?)", output)
+    return match.group(1) if match else None
+
+
+def inspect_system():
+    docker_version = package_version("docker-ce")
+    docker_candidate = apt_candidate("docker-ce")
+    docker_binary = shutil.which("docker")
+    lazydocker = installed_lazydocker()
+    return {
+        "docker_version": docker_version,
+        "docker_candidate": docker_candidate,
+        "docker_binary": docker_binary,
+        "docker_update": version_is_newer(docker_version, docker_candidate),
+        "lazydocker": str(lazydocker) if lazydocker else None,
+        "lazydocker_version": lazydocker_version(lazydocker) if lazydocker else None,
+    }
+
+
+def fetch_latest_release():
+    request = urllib.request.Request(
+        GITHUB_API,
+        headers={"Accept": "application/vnd.github+json", "User-Agent": "lazydocker-gui"},
+    )
+    with urllib.request.urlopen(request, timeout=8) as response:
+        release = json.load(response)
+    version = release.get("tag_name", "")
+    if version.startswith("v"):
+        version = version[1:]
+    if not version:
+        raise ValueError("GitHub did not return a release version.")
+    return version, release.get("assets", [])
+
+
+def latest_lazydocker_asset(assets):
+    machine = platform.machine().lower()
+    architectures = {
+        "x86_64": "x86_64",
+        "amd64": "x86_64",
+        "aarch64": "arm64",
+        "arm64": "arm64",
+        "armv6l": "armv6",
+        "armv7l": "armv6",
+    }
+    architecture = architectures.get(machine)
+    if not architecture:
+        raise RuntimeError(f"Unsupported CPU architecture: {machine}")
+    suffix = f"_Linux_{architecture}.tar.gz"
+    archive = next(
+        (
+            asset
+            for asset in assets
+            if asset.get("name", "").startswith("lazydocker_")
+            and asset["name"].endswith(suffix)
+        ),
+        None,
+    )
+    if not archive:
+        raise RuntimeError(f"No Lazydocker Linux {architecture} release is available.")
+    checksums = next(
+        (
+            asset
+            for asset in assets
+            if "checksum" in asset.get("name", "").lower()
+            and asset["name"].endswith(".txt")
+        ),
+        None,
+    )
+    return archive, checksums
+
+
+def download_asset(asset, destination):
+    request = urllib.request.Request(
+        asset["browser_download_url"], headers={"User-Agent": "lazydocker-gui"}
+    )
+    with urllib.request.urlopen(request, timeout=30) as response, open(destination, "wb") as output:
+        shutil.copyfileobj(response, output)
+
+
+def install_latest_lazydocker():
+    version, assets = fetch_latest_release()
+    archive_asset, checksum_asset = latest_lazydocker_asset(assets)
+    USER_BINARY.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix="lazydocker-gui-") as temporary:
+        archive_path = Path(temporary) / archive_asset["name"]
+        download_asset(archive_asset, archive_path)
+        if checksum_asset:
+            checksum_path = Path(temporary) / checksum_asset["name"]
+            download_asset(checksum_asset, checksum_path)
+            checksum_match = re.search(
+                rf"^([0-9a-fA-F]{{64}})\s+\*?{re.escape(archive_asset['name'])}$",
+                checksum_path.read_text(encoding="utf-8"),
+                re.MULTILINE,
+            )
+            if not checksum_match:
+                raise RuntimeError("The release checksum file did not include this archive.")
+            import hashlib
+
+            digest = hashlib.sha256(archive_path.read_bytes()).hexdigest()
+            if digest.lower() != checksum_match.group(1).lower():
+                raise RuntimeError("The Lazydocker archive failed its SHA-256 check.")
+
+        with tarfile.open(archive_path, "r:gz") as archive:
+            member = next(
+                (
+                    item
+                    for item in archive.getmembers()
+                    if Path(item.name).name == "lazydocker" and item.isfile()
+                ),
+                None,
+            )
+            if not member or member.size > 100 * 1024 * 1024:
+                raise RuntimeError("The release archive does not contain a valid Lazydocker binary.")
+            source = archive.extractfile(member)
+            if source is None:
+                raise RuntimeError("Could not read the Lazydocker binary from the release archive.")
+            temporary_binary = Path(temporary) / "lazydocker"
+            with source, open(temporary_binary, "wb") as output:
+                shutil.copyfileobj(source, output)
+        temporary_binary.chmod(0o755)
+        temporary_binary.replace(USER_BINARY)
+    return version
+
+
+def inspect_cli():
+    info = inspect_system()
+    print(f"Docker CE: {info['docker_version'] or 'not installed'}")
+    if info["docker_candidate"]:
+        print(f"Docker CE candidate: {info['docker_candidate']}")
+    print(f"Docker command: {info['docker_binary'] or 'not found'}")
+    print(f"Lazydocker: {info['lazydocker'] or 'not installed'}")
+    if info["lazydocker_version"]:
+        print(f"Lazydocker version: {info['lazydocker_version']}")
+    return 0
+
+
+class LazydockerManager:
+    def __init__(self, root):
+        import tkinter as tk
+        from tkinter import messagebox, ttk
+
+        self.tk = tk
+        self.messagebox = messagebox
+        self.ttk = ttk
+        self.root = root
+        self.results = queue.Queue()
+        self.system = None
+        self.latest_version = None
+        self.busy = False
+
+        root.title(APP_NAME)
+        root.geometry("940x420")
+        root.minsize(900, 390)
+        root.configure(background="#f4f5f2")
+        icon_path = APP_ICON
+        if not icon_path.is_file():
+            icon_path = Path(__file__).resolve().with_name("icon_lazyDocker.png")
+        if icon_path.is_file():
+            try:
+                self.icon_image = tk.PhotoImage(file=str(icon_path))
+                root.iconphoto(True, self.icon_image)
+            except tk.TclError:
+                pass
+        self._build_ui()
+        self.refresh()
+        root.after(100, self._poll_results)
+
+    def _build_ui(self):
+        tk, ttk = self.tk, self.ttk
+        style = ttk.Style(self.root)
+        if "clam" in style.theme_names():
+            style.theme_use("clam")
+        style.configure("App.TFrame", background="#f4f5f2")
+        style.configure("Title.TLabel", background="#f4f5f2", foreground="#172522", font=("TkDefaultFont", 18, "bold"))
+        style.configure("Muted.TLabel", background="#f4f5f2", foreground="#52615b")
+        style.configure("Section.TLabel", background="#f4f5f2", foreground="#172522", font=("TkDefaultFont", 11, "bold"))
+        style.configure("Status.TLabel", background="#e5e9e5", foreground="#263a32", padding=10)
+        style.configure("Primary.TButton", padding=(12, 7), background="#176b50", foreground="#ffffff")
+        style.map("Primary.TButton", background=[("active", "#10563f")])
+
+        container = ttk.Frame(self.root, style="App.TFrame", padding=22)
+        container.pack(fill="both", expand=True)
+        ttk.Label(container, text="Lazydocker Manager", style="Title.TLabel").pack(anchor="w")
+        ttk.Label(
+            container,
+            text="Check Docker CE and Lazydocker, then open Lazydocker in a terminal.",
+            style="Muted.TLabel",
+            wraplength=530,
+        ).pack(anchor="w", pady=(5, 18))
+
+        self.docker_value = tk.StringVar(value="Checking...")
+        self.lazydocker_value = tk.StringVar(value="Checking...")
+        status_frame = ttk.Frame(container, style="App.TFrame")
+        status_frame.pack(fill="x", pady=(0, 12))
+        ttk.Label(status_frame, text="DOCKER CE", style="Section.TLabel").grid(row=0, column=0, sticky="w", pady=(0, 12))
+        self.docker_label = ttk.Label(status_frame, textvariable=self.docker_value, style="Muted.TLabel", wraplength=390)
+        self.docker_label.grid(row=0, column=1, sticky="w", padx=(20, 0), pady=(0, 12))
+        ttk.Label(status_frame, text="LAZYDOCKER", style="Section.TLabel").grid(row=1, column=0, sticky="w")
+        self.lazydocker_label = ttk.Label(status_frame, textvariable=self.lazydocker_value, style="Muted.TLabel", wraplength=390)
+        self.lazydocker_label.grid(row=1, column=1, sticky="w", padx=(20, 0))
+        status_frame.columnconfigure(1, weight=1)
+
+        self.status_value = tk.StringVar(value="Checking installed versions and upstream releases...")
+        ttk.Label(container, textvariable=self.status_value, style="Status.TLabel", wraplength=520).pack(fill="x", pady=(4, 16))
+
+        actions = ttk.Frame(container, style="App.TFrame")
+        actions.pack(fill="x", side="bottom")
+        self.launch_button = ttk.Button(actions, text="Launch Lazydocker", style="Primary.TButton", command=self.launch)
+        self.launch_button.pack(side="left")
+        self.local_update_button = ttk.Button(actions, text="Update app from local .deb", command=self.update_app_from_local_deb)
+        self.local_update_button.pack(side="left", padx=(8, 0))
+        self.uninstall_button = ttk.Button(actions, text="Uninstall app", command=self.uninstall_app)
+        self.uninstall_button.pack(side="left", padx=(8, 0))
+        self.lazy_update_button = ttk.Button(actions, text="Install / Update Lazydocker", command=self.update_lazydocker)
+        self.lazy_update_button.pack(side="left", padx=(8, 0))
+        self.docker_update_button = ttk.Button(actions, text="Update Docker CE", command=self.update_docker)
+        self.docker_update_button.pack(side="left", padx=(8, 0))
+        ttk.Button(actions, text="Check again", command=self.refresh).pack(side="right")
+        self.launch_button.state(["disabled"])
+        self.docker_update_button.pack_forget()
+
+    def refresh(self):
+        if self.busy:
+            return
+        self.busy = True
+        self.status_value.set("Checking installed versions and upstream releases...")
+        self.docker_value.set("Checking...")
+        self.lazydocker_value.set("Checking...")
+        self.launch_button.state(["disabled"])
+        self.lazy_update_button.state(["disabled"])
+        self.docker_update_button.pack_forget()
+
+        def check():
+            system = inspect_system()
+            try:
+                latest, _ = fetch_latest_release()
+                error = None
+            except Exception as exception:
+                latest, error = None, str(exception)
+            self.results.put(("check", system, latest, error))
+
+        threading.Thread(target=check, daemon=True).start()
+
+    def _poll_results(self):
+        try:
+            while True:
+                result = self.results.get_nowait()
+                if result[0] == "check":
+                    self._show_check_result(*result[1:])
+                elif result[0] == "operation":
+                    self._show_operation_result(*result[1:])
+                elif result[0] == "app-update":
+                    self._show_app_update_result(*result[1:])
+                elif result[0] == "uninstall":
+                    self._show_uninstall_result(*result[1:])
+        except queue.Empty:
+            pass
+        self.root.after(100, self._poll_results)
+
+    def _show_check_result(self, system, latest, error):
+        self.busy = False
+        self.system = system
+        self.latest_version = latest
+        docker_version = system["docker_version"]
+        if not docker_version:
+            self.docker_value.set("Not installed")
+        elif not system["docker_binary"]:
+            self.docker_value.set(f"Package {docker_version} installed, but docker command is missing")
+        elif not system["docker_candidate"]:
+            self.docker_value.set(f"Installed {docker_version} - update status unavailable")
+        else:
+            suffix = " - update available" if system["docker_update"] else " - up to date"
+            self.docker_value.set(f"Installed {docker_version}{suffix}")
+
+        if not system["lazydocker"]:
+            self.lazydocker_value.set("Not installed")
+        elif system["lazydocker_version"]:
+            if latest and version_is_newer(system["lazydocker_version"], latest):
+                suffix = f" - {latest} available"
+            elif latest:
+                suffix = " - up to date"
+            else:
+                suffix = " - update status unavailable"
+            self.lazydocker_value.set(
+                f"Installed {system['lazydocker_version']}{suffix}"
+            )
+        else:
+            self.lazydocker_value.set(f"Found at {system['lazydocker']} - version unavailable")
+
+        docker_ready = bool(docker_version and system["docker_binary"])
+        lazy_ready = bool(system["lazydocker"])
+        lazy_update = bool(
+            lazy_ready
+            and latest
+            and system["lazydocker_version"]
+            and version_is_newer(system["lazydocker_version"], latest)
+        )
+        self.lazy_update_button.configure(text="Update Lazydocker" if lazy_ready else "Install Lazydocker")
+        self.lazy_update_button.state(["!disabled"] if latest else ["disabled"])
+        self.launch_button.state(["!disabled"] if docker_ready and lazy_ready else ["disabled"])
+
+        if system["docker_update"]:
+            self.docker_update_button.pack(side="left", padx=(8, 0), before=self.lazy_update_button)
+        if not docker_version:
+            self.status_value.set("Docker CE is required. Install it from the official Ubuntu instructions.")
+            self._add_docker_setup_button()
+        elif not system["docker_binary"]:
+            self.status_value.set("Docker CE is installed, but its docker command could not be found.")
+        elif not lazy_ready:
+            self.status_value.set("Docker CE is ready. Install Lazydocker to continue.")
+        elif system["docker_update"] or lazy_update:
+            updates = []
+            if system["docker_update"]:
+                updates.append("Docker CE")
+            if lazy_update:
+                updates.append("Lazydocker")
+            self.status_value.set(f"Update available for {', '.join(updates)}. Choose an update or launch the installed version.")
+        elif error:
+            self.status_value.set("Update check could not reach GitHub; the installed version can still be launched.")
+        elif not system["docker_candidate"]:
+            self.status_value.set("Docker CE's apt repository has no available candidate; its update status is unknown.")
+        elif not system["lazydocker_version"]:
+            self.status_value.set("Could not read the installed Lazydocker version; launch it manually to continue.")
+        else:
+            self.status_value.set("Everything is current. Lazydocker runs in a terminal window.")
+
+    def _add_docker_setup_button(self):
+        if hasattr(self, "docker_setup_button"):
+            return
+        self.docker_setup_button = self.ttk.Button(
+            self.root.winfo_children()[0],
+            text="Docker CE installation guide",
+            command=lambda: __import__("webbrowser").open(DOCKER_INSTALL_URL),
+        )
+        self.docker_setup_button.pack(anchor="w", pady=(0, 12))
+
+    def launch(self):
+        if self.busy:
+            return
+        if not self.system:
+            return
+        if not self.system["docker_version"] or not self.system["docker_binary"]:
+            self.messagebox.showwarning(APP_NAME, "Docker CE and its docker command must be installed first.")
+            return
+        executable = self.system["lazydocker"]
+        if not executable:
+            self.messagebox.showwarning(APP_NAME, "Install Lazydocker before launching it.")
+            return
+        terminal = shutil.which("x-terminal-emulator")
+        if not terminal:
+            self.messagebox.showerror(APP_NAME, "No terminal emulator was found.")
+            return
+        try:
+            subprocess.Popen(
+                [terminal, "-e", executable],
+                cwd=str(Path.home()),
+                start_new_session=True,
+            )
+            self.root.destroy()
+        except OSError as error:
+            self.messagebox.showerror(APP_NAME, f"Could not open Lazydocker: {error}")
+
+    def update_lazydocker(self):
+        if self.busy:
+            return
+        self.busy = True
+        self.lazy_update_button.state(["disabled"])
+        self.status_value.set("Downloading and installing Lazydocker for this user...")
+
+        def install():
+            try:
+                version = install_latest_lazydocker()
+                self.results.put(("operation", True, f"Lazydocker {version} installed."))
+            except Exception as error:
+                self.results.put(("operation", False, f"Lazydocker update failed: {error}"))
+
+        threading.Thread(target=install, daemon=True).start()
+
+    def update_app_from_local_deb(self):
+        if self.busy:
+            return
+        from tkinter import filedialog
+
+        package_file = filedialog.askopenfilename(
+            parent=self.root,
+            title="Select a Lazydocker GUI update package",
+            filetypes=(("Debian packages", "*.deb"), ("All files", "*")),
+        )
+        if not package_file:
+            return
+        package_path = Path(package_file).resolve()
+        package_name = command_output(["dpkg-deb", "-f", str(package_path), "Package"])
+        package_version = command_output(["dpkg-deb", "-f", str(package_path), "Version"])
+        if package_name != "lazydocker-gui" or not package_version:
+            self.messagebox.showerror(APP_NAME, "Select a valid Lazydocker GUI .deb package.")
+            return
+
+        current_version = command_output(
+            ["dpkg-query", "-W", "-f=${Version}", "lazydocker-gui"]
+        )
+        if not current_version:
+            self.messagebox.showerror(APP_NAME, "Lazydocker GUI is not installed through dpkg.")
+            return
+        if not version_is_newer(current_version, package_version):
+            equal = subprocess.run(
+                ["dpkg", "--compare-versions", current_version, "eq", package_version],
+                check=False,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            ).returncode == 0
+            if equal:
+                self.messagebox.showinfo(APP_NAME, "That version is already installed.")
+            else:
+                self.messagebox.showwarning(APP_NAME, "The selected package is older than the installed version.")
+            return
+        if not shutil.which("pkexec"):
+            self.messagebox.showerror(APP_NAME, "Administrator authentication (pkexec) is unavailable.")
+            return
+        if not self.messagebox.askyesno(
+            APP_NAME,
+            f"Install Lazydocker GUI {package_version} from this file? Administrator authentication will be required.",
+        ):
+            return
+
+        self.busy = True
+        self.local_update_button.state(["disabled"])
+        self.status_value.set(f"Installing Lazydocker GUI {package_version}...")
+
+        def install():
+            try:
+                result = subprocess.run(
+                    ["pkexec", "/usr/bin/apt-get", "install", "-y", str(package_path)],
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                    timeout=600,
+                )
+                if result.returncode != 0:
+                    detail = (result.stderr or result.stdout).strip()
+                    raise RuntimeError(detail or "The local package installation was cancelled or failed.")
+                self.results.put(("app-update", True, package_version))
+            except Exception as error:
+                self.results.put(("app-update", False, str(error)))
+
+        threading.Thread(target=install, daemon=True).start()
+
+    def _show_app_update_result(self, success, detail):
+        self.busy = False
+        self.local_update_button.state(["!disabled"])
+        if success:
+            message = f"Lazydocker GUI {detail} was installed. Close and reopen the app to use the updated version."
+            self.status_value.set(message)
+            self.messagebox.showinfo(APP_NAME, message)
+        else:
+            message = f"Local app update failed: {detail}"
+            self.status_value.set(message)
+            self.messagebox.showerror(APP_NAME, message)
+
+    def uninstall_app(self):
+        if self.busy:
+            return
+        if not shutil.which("pkexec"):
+            self.messagebox.showerror(APP_NAME, "Administrator authentication (pkexec) is unavailable.")
+            return
+        if not self.messagebox.askyesno(
+            APP_NAME,
+            "Remove Lazydocker GUI? Docker CE and Lazydocker will remain installed.",
+        ):
+            return
+
+        self.busy = True
+        self.uninstall_button.state(["disabled"])
+        self.status_value.set("Removing Lazydocker GUI...")
+
+        def remove():
+            try:
+                result = subprocess.run(
+                    ["pkexec", "/usr/bin/apt-get", "remove", "-y", "lazydocker-gui"],
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                    timeout=600,
+                )
+                if result.returncode != 0:
+                    detail = (result.stderr or result.stdout).strip()
+                    raise RuntimeError(detail[-1200:] if detail else "Package removal was cancelled or failed.")
+                self.results.put(("uninstall", True, ""))
+            except Exception as error:
+                self.results.put(("uninstall", False, str(error)))
+
+        threading.Thread(target=remove, daemon=True).start()
+
+    def _show_uninstall_result(self, success, detail):
+        self.busy = False
+        if success:
+            self.messagebox.showinfo(
+                APP_NAME,
+                "Lazydocker GUI was removed. Docker CE and Lazydocker were left installed.",
+            )
+            self.root.destroy()
+        else:
+            message = f"Uninstall failed: {detail}"
+            self.status_value.set(message)
+            self.uninstall_button.state(["!disabled"])
+            self.messagebox.showerror(APP_NAME, message)
+
+    def update_docker(self):
+        if self.busy:
+            return
+        if not shutil.which("pkexec"):
+            self.messagebox.showinfo(
+                APP_NAME,
+                "Administrator authentication (pkexec) is unavailable. Update Docker CE with your system package manager.",
+            )
+            return
+        installed = [package for package in DOCKER_PACKAGES if package_version(package)]
+        if not installed:
+            return
+        if not self.messagebox.askyesno(
+            APP_NAME,
+            "Update Docker CE and its installed components using apt? Administrator authentication will be required.",
+        ):
+            return
+        self.busy = True
+        self.docker_update_button.state(["disabled"])
+        self.status_value.set("Requesting administrator approval to update Docker CE...")
+
+        def update():
+            try:
+                update_result = subprocess.run(
+                    ["pkexec", "/usr/bin/apt-get", "update"],
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                    timeout=600,
+                )
+                if update_result.returncode != 0:
+                    detail = (update_result.stderr or update_result.stdout).strip()
+                    raise RuntimeError(detail or "apt-get update was cancelled or failed.")
+                upgrade_result = subprocess.run(
+                    [
+                        "pkexec",
+                        "/usr/bin/apt-get",
+                        "install",
+                        "--only-upgrade",
+                        "-y",
+                        *installed,
+                    ],
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                    timeout=600,
+                )
+                if upgrade_result.returncode != 0:
+                    detail = (upgrade_result.stderr or upgrade_result.stdout).strip()
+                    raise RuntimeError(detail or "apt-get could not update Docker CE.")
+                self.results.put(("operation", True, "Docker CE updated successfully."))
+            except Exception as error:
+                self.results.put(("operation", False, f"Docker CE update failed: {error}"))
+
+        threading.Thread(target=update, daemon=True).start()
+
+    def _show_operation_result(self, success, message):
+        self.busy = False
+        self.status_value.set(message)
+        if success:
+            self.refresh()
+        else:
+            self.lazy_update_button.state(["!disabled"] if self.latest_version else ["disabled"])
+            if self.system and self.system["docker_update"]:
+                self.docker_update_button.state(["!disabled"])
+            self.messagebox.showerror(APP_NAME, message)
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Check Docker CE and launch Lazydocker.")
+    parser.add_argument("--check", action="store_true", help="print installed component status and exit")
+    arguments = parser.parse_args()
+    if arguments.check:
+        return inspect_cli()
+    try:
+        import tkinter as tk
+    except ImportError:
+        print("Tk is not installed. Install the python3-tk package and try again.", file=sys.stderr)
+        return 1
+    root = tk.Tk()
+    LazydockerManager(root)
+    root.mainloop()
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
